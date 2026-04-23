@@ -1,0 +1,713 @@
+---
+title:    "`r params$qaqc_params$report_title`"
+subtitle: "`r params$qaqc_params$report_subtitle`"
+author:   "`r params$qaqc_params$report_author`"
+date:     "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    df_print: paged
+    theme: cosmo
+    highlight: tango
+    code_folding: hide
+params:
+  qaqc_params: NULL
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.pos = "H",
+  out.extra = ""
+)
+
+pacman::p_load(
+  dplyr, tidyr, readr, stringr, forcats,
+  ggplot2, scales, patchwork,
+  knitr, kableExtra,
+  survey, Hmisc, glue, data.table
+)
+
+p <- params$qaqc_params  # shorthand
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+#' Styled kable table for HTML
+qaqc_table <- function(df, caption = "", digits = 1, ...) {
+  kable(df,
+    caption  = caption,
+    digits   = digits,
+    format   = "html",
+    ...
+  ) |>
+    kable_styling(
+      bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+      full_width = FALSE,
+      font_size = 13
+    )
+}
+
+# #' Styled kable table for PDF
+# qaqc_table <- function(df, caption = "", digits = 1, ...) {
+#   kable(df,
+#     caption  = caption,
+#     booktabs = TRUE,
+#     digits   = digits,
+#     linesep  = "",
+#     format   = "latex",
+#     ...
+#   ) |>
+#     kable_styling(
+#       latex_options = c("HOLD_position", "striped", "scale_down"),
+#       stripe_color  = "lightgray",
+#       font_size     = 9
+#     )
+# }
+
+#' Consistent ggplot theme
+theme_qaqc <- function() {
+  theme_minimal(base_size = 10) +
+    theme(
+      plot.title       = element_text(size = 11, face = "bold", color = "#1F618D"),
+      plot.subtitle    = element_text(size = 9,  color = "grey40"),
+      axis.text        = element_text(size = 8),
+      axis.title       = element_text(size = 9),
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_line(color = "grey92"),
+      legend.position  = "bottom",
+      legend.text      = element_text(size = 8),
+      strip.text       = element_text(size = 9, face = "bold")
+    )
+}
+
+# ── Survey design (built once, reused everywhere) ─────────────────────────────
+#
+# All weighted estimates (means, proportions, quantiles) go through this
+# svydesign object so that clustering and stratification are always accounted
+# for consistently.
+#
+# Build is deferred to after data load (see load-data chunk).
+# Access via: svy_design (global, available in all subsequent chunks)
+
+build_svy_design <- function(df, p) {
+  svydesign(
+    ids     = if (!is.null(p$cluster_var) && p$cluster_var %in% names(df))
+                as.formula(paste0("~", p$cluster_var)) else ~1,
+    strata  = if (!is.null(p$strata_var) && p$strata_var %in% names(df))
+                as.formula(paste0("~", p$strata_var)) else NULL,
+    weights = as.formula(paste0("~", p$weight_var)),
+    data    = df,
+    nest    = TRUE
+  )
+}
+
+# ── Weighted summary statistics for a numeric variable ────────────────────────
+
+#' Compute weighted descriptive stats for one numeric variable.
+#' Uses svydesign for mean/SE; weighted quantiles via Hmisc::wtd.quantile.
+#' Returns a tidy data.frame(Statistic, Value).
+wtd_stats <- function(svy, var, weight_var) {
+
+  df_v <- svy$variables
+  x    <- df_v[[var]]
+  w    <- df_v[[weight_var]]
+
+  # Restrict to non-missing
+  ok   <- !is.na(x) & !is.na(w) & w > 0
+  x_ok <- x[ok]
+  w_ok <- w[ok]
+
+  # Effective sample size (Kish formula)
+  n_eff <- round(sum(w_ok)^2 / sum(w_ok^2))
+
+  # Weighted mean & SE via survey package
+  svy_sub  <- subset(svy, !is.na(svy$variables[[var]]))
+  est_mean <- svymean(as.formula(paste0("~", var)), svy_sub, na.rm = TRUE)
+  w_mean   <- coef(est_mean)[1]
+  w_se     <- SE(est_mean)[1]
+
+  # Weighted variance & SD
+  est_var  <- svyvar(as.formula(paste0("~", var)), svy_sub, na.rm = TRUE)
+  w_sd     <- sqrt(as.numeric(est_var)[1])
+
+  # Weighted quantiles (Harrell-Davis via Hmisc, falls back to simple if absent)
+  wtd_q <- tryCatch({
+    Hmisc::wtd.quantile(x_ok, weights = w_ok,
+                        probs = c(0, 0.25, 0.5, 0.75, 1))
+  }, error = function(e) {
+    # Simple weighted quantile fallback
+    ord  <- order(x_ok)
+    cw   <- cumsum(w_ok[ord]) / sum(w_ok)
+    sapply(c(0, 0.25, 0.5, 0.75, 1),
+           function(q) x_ok[ord][which(cw >= q)[1]])
+  })
+
+  # Weighted skewness: sum(w*(x - xbar)^3) / (sum(w) * sd^3)
+  xbar   <- w_mean
+  m3     <- sum(w_ok * (x_ok - xbar)^3) / sum(w_ok)
+  w_skew <- m3 / w_sd^3
+
+  data.frame(
+    Statistic = c("N (non-missing)", "N (missing)",
+                  "Effective N (Kish)", "Sum of weights",
+                  "Weighted mean", "Weighted SE (mean)",
+                  "Weighted std dev",
+                  "Min", "Wtd P25", "Wtd median",
+                  "Wtd P75", "Max",
+                  "Weighted skewness"),
+    Value = c(
+      format(sum(ok),        big.mark = ","),
+      format(sum(!ok),       big.mark = ","),
+      format(n_eff,          big.mark = ","),
+      format(round(sum(w_ok)), big.mark = ","),
+      round(w_mean,  2),
+      round(w_se,    4),
+      round(w_sd,    2),
+      round(wtd_q[1], 2),
+      round(wtd_q[2], 2),
+      round(wtd_q[3], 2),
+      round(wtd_q[4], 2),
+      round(wtd_q[5], 2),
+      round(w_skew,  3)
+    )
+  )
+}
+
+# ── Weighted frequency table for a categorical variable ───────────────────────
+
+#' Compute weighted frequencies for one categorical variable.
+#' Returns a tidy data.frame(Category, N_wtd, Pct_wtd, Cum_pct).
+wtd_freq <- function(svy, var, weight_var) {
+
+  df_v <- svy$variables |> filter(!is.na(.data[[var]]))
+
+  df_v |>
+    group_by(.data[[var]]) |>
+    summarise(N_wtd = sum(.data[[weight_var]]), .groups = "drop") |>
+    arrange(desc(N_wtd)) |>
+    mutate(
+      Pct_wtd = round(N_wtd / sum(N_wtd) * 100, 1),
+      Cum_pct = cumsum(Pct_wtd),
+      N_wtd   = round(N_wtd)
+    ) |>
+    rename(Category = 1)
+}
+
+# ── Weighted proportion with CI ───────────────────────────────────────────────
+
+#' Estimate a weighted proportion and its 95% CI.
+#' numerator_expr and denom_filter are character strings evaluated on df.
+#' Returns data.frame(n_wtd, pct, ci_low, ci_high).
+weighted_prop <- function(df, numerator_expr, denom_filter, p) {
+
+  df_d <- df |> filter(eval(parse(text = denom_filter)))
+  if (nrow(df_d) == 0)
+    return(data.frame(n_wtd = 0, pct = NA, ci_low = NA, ci_high = NA))
+
+  svy_d <- build_svy_design(df_d, p)
+  svy_d$variables$.ind <- as.numeric(
+    eval(parse(text = numerator_expr), envir = svy_d$variables)
+  )
+
+  est <- svymean(~.ind, svy_d, na.rm = TRUE)
+  ci  <- confint(est, level = 0.95)
+
+  data.frame(
+    n_wtd   = round(sum(df_d[[p$weight_var]], na.rm = TRUE)),
+    pct     = coef(est)[1] * 100,
+    ci_low  = ci[1] * 100,
+    ci_high = ci[2] * 100
+  )
+}
+
+#' Breakdown of weighted_prop by a grouping variable.
+weighted_prop_by <- function(df, numerator_expr, denom_filter, p, by_var) {
+
+  df |>
+    filter(eval(parse(text = denom_filter)), !is.na(.data[[by_var]])) |>
+    group_by(.data[[by_var]]) |>
+    group_map(~ {
+      res <- tryCatch(
+        weighted_prop(.x, numerator_expr, "TRUE", p),
+        error = function(e)
+          data.frame(n_wtd = nrow(.x), pct = NA, ci_low = NA, ci_high = NA)
+      )
+      res[[by_var]] <- .y[[by_var]]
+      res
+    }) |>
+    bind_rows() |>
+    relocate(all_of(by_var))
+}
+```
+
+```{r load-data}
+df <- read_csv(p$input_file, show_col_types = FALSE)
+
+n_rows <- nrow(df)
+n_cols <- ncol(df)
+n_hh   <- n_distinct(df$hhid)
+
+# Build survey design once — reused by all weighted estimates
+svy_design <- build_svy_design(df, p)
+```
+
+\newpage
+
+# Dataset overview
+
+```{r overview-table}
+# Weighted urban/rural split
+milieu_wtd <- df |>
+  group_by(milieu) |>
+  summarise(w = sum(.data[[p$weight_var]], na.rm = TRUE), .groups = "drop") |>
+  mutate(pct = round(w / sum(w) * 100, 1))
+milieu_str <- paste0(milieu_wtd$pct, "% ", milieu_wtd$milieu, collapse = " / ")
+
+overview <- data.frame(
+  Metric = c("Total individuals", "Total households",
+             "Columns", "Survey waves",
+             "Regions", "Urban / Rural split (weighted)"),
+  Value = c(
+    format(n_rows, big.mark = ","),
+    format(n_hh,   big.mark = ","),
+    n_cols,
+    paste(sort(unique(df$vague)), collapse = ", "),
+    n_distinct(df$region),
+    milieu_str
+  )
+)
+
+qaqc_table(overview, caption = "Dataset summary")
+```
+
+\newpage
+
+# Data quality
+
+## Missing values
+
+```{r missing-values}
+na_df <- df |>
+  summarise(across(everything(), ~ sum(is.na(.)))) |>
+  pivot_longer(everything(), names_to = "Variable", values_to = "N_missing") |>
+  mutate(
+    Pct_missing = round(N_missing / n_rows * 100, 1),
+    Status = case_when(
+      Pct_missing == 0            ~ "Complete",
+      Pct_missing < 10            ~ "< 10%",
+      Pct_missing < 50            ~ "10 – 50%",
+      TRUE                        ~ "> 50%"
+    )
+  ) |>
+  filter(N_missing > 0) |>
+  arrange(desc(Pct_missing))
+
+qaqc_table(na_df,
+  caption = "Missing values by variable (only variables with at least one NA shown)",
+  col.names = c("Variable", "N missing", "% missing", "Status")
+)
+```
+
+```{r missing-plot, fig.cap="Missing value rate by variable (top 20)"}
+na_plot <- na_df |> slice_head(n = 20) |>
+  mutate(Variable = fct_reorder(Variable, Pct_missing))
+
+ggplot(na_plot, aes(x = Pct_missing, y = Variable, fill = Status)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = paste0(Pct_missing, "%")),
+            hjust = -0.1, size = 2.8) +
+  scale_fill_manual(values = c(
+    "Complete" = "#27AE60",
+    "< 10%"    = "#F39C12",
+    "10 – 50%" = "#E67E22",
+    "> 50%"    = "#C0392B"
+  )) +
+  scale_x_continuous(limits = c(0, 110), labels = label_percent(scale = 1)) +
+  labs(x = "Missing (%)", y = NULL, fill = NULL,
+       title = "Missing value rate — top 20 variables") +
+  theme_qaqc()
+```
+
+## Consistency checks
+
+```{r consistency-checks}
+checks_df <- purrr::map_dfr(p$consistency_checks, function(chk) {
+  n_issues <- tryCatch(
+    sum(eval(parse(text = chk$condition_expr), envir = df), na.rm = TRUE),
+    error = function(e) NA_integer_
+  )
+  data.frame(
+    Check    = chk$label,
+    N_issues = n_issues,
+    Pct      = round(n_issues / n_rows * 100, 3),
+    Status   = ifelse(is.na(n_issues), "Error", ifelse(n_issues == 0, "OK", "Issues found"))
+  )
+})
+
+qaqc_table(checks_df,
+  caption = "Consistency checks",
+  col.names = c("Check", "N issues", "% of rows", "Status")
+)
+```
+
+\newpage
+
+# Univariate analysis
+
+## Numerical variables
+
+```{r numeric-univariate, results='asis'}
+for (v in intersect(p$vars_numeric, names(df))) {
+
+  if (all(is.na(df[[v]]))) next
+
+  cat(glue("\n\n### {v}\n\n"))
+
+  # Weighted summary stats via svydesign
+  stats <- wtd_stats(svy_design, v, p$weight_var)
+  print(qaqc_table(stats, caption = glue("Weighted summary statistics — {v}")))
+
+  # Weighted histogram: use weights as frequency
+  df_v <- df |> filter(!is.na(.data[[v]]), !is.na(.data[[p$weight_var]]))
+
+  p_hist <- ggplot(df_v, aes(x = .data[[v]], weight = .data[[p$weight_var]])) +
+    geom_histogram(fill = "#2E86C1", color = "white", bins = 40, alpha = 0.85) +
+    scale_x_continuous(labels = label_comma()) +
+    scale_y_continuous(labels = label_comma()) +
+    labs(x = v, y = "Weighted count",
+         title    = glue("Weighted distribution — {v}"),
+         subtitle = glue("Weights: {p$weight_var}")) +
+    theme_qaqc()
+
+  # Weighted boxplot by milieu (if available)
+  if ("milieu" %in% names(df)) {
+    df_vm <- df_v |> filter(!is.na(milieu))
+    p_box <- ggplot(df_vm,
+                    aes(x = milieu, y = .data[[v]],
+                        weight = .data[[p$weight_var]], fill = milieu)) +
+      geom_boxplot(alpha = 0.7, outlier.size = 0.8,
+                   outlier.color = "#C0392B") +
+      scale_y_continuous(labels = label_comma()) +
+      scale_fill_manual(
+        values = c("Urbain" = "#2E86C1", "Rural" = "#28B463"),
+        guide  = "none"
+      ) +
+      labs(x = NULL, y = v, title = "By milieu") +
+      theme_qaqc()
+  } else {
+    p_box <- ggplot(df_v, aes(y = .data[[v]],
+                               weight = .data[[p$weight_var]])) +
+      geom_boxplot(fill = "#2E86C1", alpha = 0.7,
+                   outlier.size = 0.8, outlier.color = "#C0392B") +
+      scale_y_continuous(labels = label_comma()) +
+      labs(y = v, title = "Boxplot") +
+      theme_qaqc() +
+      theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+  }
+
+  print(p_hist + p_box + plot_layout(widths = c(2, 1)))
+  cat("\n\n")
+}
+```
+
+## Categorical variables
+
+```{r categ-univariate, results='asis'}
+for (v in intersect(p$vars_categ, names(df))) {
+
+  if (all(is.na(df[[v]]))) next
+
+  cat(glue("\n\n### {v}\n\n"))
+
+  # Weighted frequency table
+  tab <- wtd_freq(svy_design, v, p$weight_var)
+
+  print(qaqc_table(tab,
+    caption   = glue("Weighted frequency table — {v}"),
+    col.names = c(v, "Weighted N", "Wtd %", "Cumul. %")
+  ))
+
+  # Weighted bar chart
+  n_cats <- nrow(tab)
+  tab_plot <- if (n_cats > 15) slice_head(tab, n = 15) else tab
+  subtitle  <- if (n_cats > 15) "(Top 15 shown)" else glue("Weights: {p$weight_var}")
+
+  p_bar <- ggplot(tab_plot,
+                  aes(x = fct_reorder(Category, Pct_wtd), y = Pct_wtd)) +
+    geom_col(fill = "#2E86C1", alpha = 0.85, width = 0.7) +
+    geom_text(aes(label = paste0(Pct_wtd, "%")),
+              hjust = -0.1, size = 2.8) +
+    coord_flip() +
+    scale_y_continuous(
+      limits = c(0, max(tab_plot$Pct_wtd) * 1.18),
+      labels = label_percent(scale = 1)
+    ) +
+    labs(x = NULL, y = "Weighted %",
+         title    = glue("Weighted distribution — {v}"),
+         subtitle = subtitle) +
+    theme_qaqc()
+
+  print(p_bar)
+  cat("\n\n")
+}
+```
+
+\newpage
+
+# Key EHCVM indicators
+
+```{r indicators, results='asis'}
+for (ind in p$indicators) {
+
+  cat(glue("\n\n## {ind$label}\n\n"))
+
+  # --- Overall weighted estimate ---
+  overall <- tryCatch(
+    weighted_prop(df, ind$numerator_expr, ind$denominator_filter, p),
+    error = function(e) data.frame(n_wtd = NA, pct = NA, ci_low = NA, ci_high = NA)
+  )
+
+  overall_tab <- data.frame(
+    Level    = "Overall",
+    N_wtd    = format(overall$n_wtd, big.mark = ","),
+    Rate_pct = round(overall$pct, 1),
+    CI_95    = glue("[{round(overall$ci_low,1)}, {round(overall$ci_high,1)}]")
+  )
+
+  print(qaqc_table(overall_tab,
+    caption   = glue("Overall weighted estimate — {ind$label}"),
+    col.names = c("Level", "Weighted N (denom.)", "Rate (%)", "95% CI")
+  ))
+
+  # --- Breakdown by each variable ---
+  plots_list <- list()
+
+  for (by_var in intersect(ind$breakdown_vars, names(df))) {
+
+    breakdown <- tryCatch(
+      weighted_prop_by(df, ind$numerator_expr, ind$denominator_filter,
+                       p, by_var),
+      error = function(e) NULL
+    )
+
+    if (is.null(breakdown) || all(is.na(breakdown$pct))) next
+
+    print(qaqc_table(
+      breakdown |>
+        mutate(CI_95 = glue("[{round(ci_low,1)}, {round(ci_high,1)}]")) |>
+        select(-ci_low, -ci_high),
+      caption   = glue("{ind$label} — by {by_var}"),
+      col.names = c(by_var, "Weighted N", "Rate (%)", "95% CI")
+    ))
+
+    p_plot <- ggplot(breakdown,
+                     aes(x = fct_reorder(.data[[by_var]], pct), y = pct)) +
+      geom_col(fill = "#1F618D", alpha = 0.85, width = 0.65) +
+      geom_errorbar(aes(ymin = ci_low, ymax = ci_high),
+                    width = 0.25, color = "#C0392B", linewidth = 0.6) +
+      geom_text(aes(label = paste0(round(pct, 1), "%")),
+                hjust = -0.15, size = 2.8) +
+      coord_flip() +
+      scale_y_continuous(
+        limits = c(0, min(105, max(breakdown$pct, na.rm = TRUE) * 1.2)),
+        labels = label_percent(scale = 1)
+      ) +
+      labs(x = NULL, y = "Weighted rate (%)",
+           title    = glue("{ind$label}"),
+           subtitle = glue("By {by_var} — error bars: 95% CI")) +
+      theme_qaqc()
+
+    plots_list[[by_var]] <- p_plot
+  }
+
+  if (length(plots_list) > 0) {
+    pairs <- split(seq_along(plots_list),
+                   ceiling(seq_along(plots_list) / 2))
+    for (pair in pairs) {
+      if (length(pair) == 2) {
+        print(plots_list[[pair[1]]] + plots_list[[pair[2]]])
+      } else {
+        print(plots_list[[pair[1]]])
+      }
+      cat("\n\n")
+    }
+  }
+}
+```
+
+\newpage
+
+# Bivariate analysis
+
+## Age pyramid
+
+```{r age-pyramid, fig.cap="Weighted age pyramid by sex", fig.height=6}
+age_pyr <- df |>
+  filter(!is.na(age), !is.na(sexe), !is.na(.data[[p$weight_var]])) |>
+  mutate(age_group = cut(age,
+    breaks = c(0, 4, 9, 14, 19, 24, 29, 34, 39, 44, 49, 54, 59, 64, 69, 200),
+    labels = c("0-4","5-9","10-14","15-19","20-24","25-29",
+               "30-34","35-39","40-44","45-49","50-54",
+               "55-59","60-64","65-69","70+"),
+    right = TRUE, include.lowest = TRUE
+  )) |>
+  group_by(age_group, sexe) |>
+  summarise(n_wtd = sum(.data[[p$weight_var]]), .groups = "drop") |>
+  mutate(n_wtd = if_else(sexe == "Masculin", n_wtd, -n_wtd))
+
+ggplot(age_pyr, aes(x = age_group, y = n_wtd, fill = sexe)) +
+  geom_col(width = 0.85, alpha = 0.9) +
+  coord_flip() +
+  scale_y_continuous(labels = function(x) format(abs(x), big.mark = ",")) +
+  scale_fill_manual(values = c("Masculin" = "#2E86C1", "Féminin" = "#E74C3C")) +
+  labs(x = "Age group", y = glue("Weighted count ({p$weight_var})"), fill = NULL,
+       title    = "Weighted age pyramid",
+       subtitle = "Masculin (right) | Féminin (left)") +
+  theme_qaqc()
+```
+
+## Education level by sex and milieu
+
+```{r educ-crossplot, fig.cap="Highest education level by sex and milieu (weighted, population 15+)", fig.height=5}
+educ_df <- df |>
+  filter(!is.na(educ_hi), !is.na(sexe), !is.na(milieu),
+         age >= 15, !is.na(.data[[p$weight_var]])) |>
+  group_by(educ_hi, sexe, milieu) |>
+  summarise(n_wtd = sum(.data[[p$weight_var]]), .groups = "drop") |>
+  group_by(sexe, milieu) |>
+  mutate(pct = n_wtd / sum(n_wtd) * 100) |>
+  ungroup()
+
+ggplot(educ_df, aes(x = fct_reorder(educ_hi, pct, sum),
+                    y = pct, fill = sexe)) +
+  geom_col(position = "dodge", alpha = 0.85, width = 0.7) +
+  facet_wrap(~milieu) +
+  coord_flip() +
+  scale_fill_manual(values = c("Masculin" = "#2E86C1", "Féminin" = "#E74C3C")) +
+  scale_y_continuous(labels = label_percent(scale = 1)) +
+  labs(x = NULL, y = "Weighted %", fill = NULL,
+       title    = "Highest education level — population 15+",
+       subtitle = glue("Weighted by {p$weight_var} — by sex and milieu")) +
+  theme_qaqc()
+```
+
+## Activity status by age group
+
+```{r activ-age, fig.cap="Activity status by age group — weighted (15-64 yrs)", fig.height=5}
+activ_age <- df |>
+  filter(age >= 15, age <= 64, !is.na(activ7j),
+         !is.na(.data[[p$weight_var]])) |>
+  mutate(age_grp = cut(age,
+    breaks = c(15, 24, 34, 44, 54, 64),
+    labels = c("15-24", "25-34", "35-44", "45-54", "55-64"),
+    include.lowest = TRUE
+  )) |>
+  group_by(age_grp, activ7j) |>
+  summarise(n_wtd = sum(.data[[p$weight_var]]), .groups = "drop") |>
+  group_by(age_grp) |>
+  mutate(pct = n_wtd / sum(n_wtd) * 100) |>
+  ungroup()
+
+ggplot(activ_age, aes(x = age_grp, y = pct, fill = activ7j)) +
+  geom_col(position = "stack", width = 0.7, alpha = 0.9) +
+  scale_fill_brewer(palette = "Set2") +
+  scale_y_continuous(labels = label_percent(scale = 1)) +
+  labs(x = "Age group", y = "Weighted %", fill = "Activity status",
+       title    = "Activity status by age group",
+       subtitle = glue("Weighted by {p$weight_var} — population 15–64 years")) +
+  theme_qaqc()
+```
+
+## Salary distribution by region
+
+```{r salary-region, fig.cap="Salary distribution by region (employed, non-zero salary)", fig.height=5}
+sal_df <- df |>
+  filter(!is.na(salaire), salaire > 0, !is.na(region))
+
+ggplot(sal_df, aes(x = fct_reorder(region, salaire, median),
+                   y = salaire, fill = region)) +
+  geom_boxplot(alpha = 0.75, outlier.size = 0.5,
+               outlier.color = "grey60", show.legend = FALSE) +
+  scale_y_continuous(
+    trans  = "log10",
+    labels = label_comma(prefix = "FCFA ")
+  ) +
+  coord_flip() +
+  labs(x = NULL, y = "Salary (log scale)", fill = NULL,
+       title    = "Salary distribution by region",
+       subtitle = "Employed individuals with non-zero salary — log10 scale") +
+  theme_qaqc()
+```
+
+## Household size distribution by region
+
+```{r hh-size-region, fig.cap="Household size by region", fig.height=5}
+hh_size <- df |>
+  filter(!is.na(menage), !is.na(region)) |>
+  distinct(hhid, .keep_all = TRUE)
+
+ggplot(hh_size, aes(x = fct_reorder(region, menage, median),
+                    y = menage, fill = region)) +
+  geom_violin(alpha = 0.6, show.legend = FALSE, trim = TRUE) +
+  geom_boxplot(width = 0.15, fill = "white", alpha = 0.9,
+               outlier.size = 0.5, show.legend = FALSE) +
+  coord_flip() +
+  labs(x = NULL, y = "Household size",
+       title    = "Household size by region",
+       subtitle = "One observation per household") +
+  theme_qaqc()
+```
+
+\newpage
+
+# Sampling weights
+
+```{r weights-check, fig.cap="Distribution of sampling weights"}
+w <- df[[p$weight_var]]
+
+w_stats <- data.frame(
+  Statistic = c("Min", "P25", "Median", "Mean", "P75", "Max",
+                "CV (std/mean)", "N zero/negative"),
+  Value = c(
+    round(min(w,  na.rm=TRUE), 2),
+    round(quantile(w, 0.25, na.rm=TRUE), 2),
+    round(median(w, na.rm=TRUE), 2),
+    round(mean(w, na.rm=TRUE), 2),
+    round(quantile(w, 0.75, na.rm=TRUE), 2),
+    round(max(w, na.rm=TRUE), 2),
+    round(sd(w, na.rm=TRUE) / mean(w, na.rm=TRUE), 3),
+    sum(w <= 0, na.rm=TRUE)
+  )
+)
+
+qaqc_table(w_stats, caption = glue("Sampling weight summary ({p$weight_var})"))
+
+ggplot(df, aes(x = .data[[p$weight_var]])) +
+  geom_histogram(fill = "#8E44AD", color = "white", bins = 60, alpha = 0.8) +
+  scale_x_continuous(labels = label_comma()) +
+  labs(x = "Weight", y = "Count",
+       title    = glue("Distribution of sampling weights ({p$weight_var})"),
+       subtitle = "Highly unequal weights may inflate variance estimates") +
+  theme_qaqc()
+```
+
+\newpage
+
+# Session info
+
+```{r session-info}
+data.frame(
+  Item  = c("R version", "Report generated", "Input file", "N rows", "N columns"),
+  Value = c(
+    as.character(getRversion()),
+    format(Sys.time(), "%Y-%m-%d %H:%M"),
+    basename(p$input_file),
+    format(n_rows, big.mark = ","),
+    n_cols
+  )
+) |>
+  qaqc_table(caption = "Session information")
+```

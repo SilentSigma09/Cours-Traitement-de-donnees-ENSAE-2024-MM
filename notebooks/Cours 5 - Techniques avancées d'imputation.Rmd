@@ -25,7 +25,7 @@ On génère un jeu de données fictif avec des valeurs manquantes.
 ```{r}
 # Installation et chargement des packages nécessaires
 # install.packages(c("naniar", "VIM", "MissMech", "mice", "ISLR"))
-
+install.packages("BaylorEdPsych")
 ```
 
 ```{r}
@@ -148,7 +148,7 @@ df$wage_na <- as.numeric(is.na(df$wage))
 
 # Vérifier les modalités des variables catégorielles
 summary(df)
-
+df$wage_na |> table()
 modele_logit <- glm(wage_na ~ age + maritl + race + jobclass + health,
                     data = df,
                     family = binomial)
